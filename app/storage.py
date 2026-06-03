@@ -30,6 +30,8 @@ SCHEMA_VERSION = 1
 # mutators still flush immediately so data is not lost on crash.
 _library_cache: dict[str, dict[str, Any]] | None = None
 _library_dirty: bool = False
+_transcripts_cache: dict[str, dict[str, Any]] | None = None
+_analysis_cache: dict[str, dict[str, Any]] | None = None
 _storage_lock = threading.Lock()
 
 
@@ -163,44 +165,52 @@ def update_analysis_status(audio_id: str, status: str, last_error: str = "") -> 
 
 
 def load_transcripts() -> dict[str, dict[str, Any]]:
-    data = _read_json(TRANSCRIPT_FILE, {})
-    return data if isinstance(data, dict) else {}
+    with _storage_lock:
+        data = _load_collection_cache_locked("transcripts")
+        return {k: dict(v) for k, v in data.items()}
 
 
 def save_transcript(audio_id: str, transcript: dict[str, Any]) -> None:
     with _storage_lock:
-        data = load_transcripts()
+        data = _load_collection_cache_locked("transcripts")
         payload = dict(transcript)
         payload["schema_version"] = SCHEMA_VERSION
         payload["updated_ts"] = int(time.time())
         data[audio_id] = payload
-    _write_json(TRANSCRIPT_FILE, data)
+        snapshot = {k: dict(v) for k, v in data.items()}
+    _write_json(TRANSCRIPT_FILE, snapshot)
 
 
 def get_transcript(audio_id: str) -> dict[str, Any] | None:
-    entry = load_transcripts().get(audio_id)
-    return entry if isinstance(entry, dict) else None
+    with _storage_lock:
+        data = _load_collection_cache_locked("transcripts")
+        entry = data.get(audio_id)
+        return dict(entry) if isinstance(entry, dict) else None
 
 
 def load_analysis() -> dict[str, dict[str, Any]]:
-    data = _read_json(ANALYSIS_FILE, {})
-    return data if isinstance(data, dict) else {}
+    with _storage_lock:
+        data = _load_collection_cache_locked("analysis")
+        return {k: dict(v) for k, v in data.items()}
 
 
 def save_analysis(audio_id: str, analysis: dict[str, Any]) -> None:
     with _storage_lock:
-        data = load_analysis()
+        data = _load_collection_cache_locked("analysis")
         payload = dict(analysis)
         payload["schema_version"] = SCHEMA_VERSION
         payload["updated_ts"] = int(time.time())
         data[audio_id] = payload
-    _write_json(ANALYSIS_FILE, data)
+        snapshot = {k: dict(v) for k, v in data.items()}
+    _write_json(ANALYSIS_FILE, snapshot)
     update_analysis_status(audio_id, "completed")
 
 
 def get_analysis(audio_id: str) -> dict[str, Any] | None:
-    entry = load_analysis().get(audio_id)
-    return entry if isinstance(entry, dict) else None
+    with _storage_lock:
+        data = _load_collection_cache_locked("analysis")
+        entry = data.get(audio_id)
+        return dict(entry) if isinstance(entry, dict) else None
 
 
 def delete_audio_source(audio_id: str, delete_cached_file: bool = True) -> dict[str, Any] | None:
@@ -213,15 +223,24 @@ def delete_audio_source(audio_id: str, delete_cached_file: bool = True) -> dict[
         snapshot = {k: dict(v) for k, v in _library_cache.items()}
     _write_json(LIBRARY_FILE, snapshot)
 
-    transcripts = load_transcripts()
-    if str(audio_id) in transcripts:
-        transcripts.pop(str(audio_id), None)
-        _write_json(TRANSCRIPT_FILE, transcripts)
+    transcript_snapshot: dict[str, dict[str, Any]] | None = None
+    analysis_snapshot: dict[str, dict[str, Any]] | None = None
+    with _storage_lock:
+        transcripts = _load_collection_cache_locked("transcripts")
+        if str(audio_id) in transcripts:
+            transcripts.pop(str(audio_id), None)
+            transcript_snapshot = {k: dict(v) for k, v in transcripts.items()}
 
-    analysis = load_analysis()
-    if str(audio_id) in analysis:
-        analysis.pop(str(audio_id), None)
-        _write_json(ANALYSIS_FILE, analysis)
+        analysis = _load_collection_cache_locked("analysis")
+        if str(audio_id) in analysis:
+            analysis.pop(str(audio_id), None)
+            analysis_snapshot = {k: dict(v) for k, v in analysis.items()}
+
+    if transcript_snapshot is not None:
+        _write_json(TRANSCRIPT_FILE, transcript_snapshot)
+
+    if analysis_snapshot is not None:
+        _write_json(ANALYSIS_FILE, analysis_snapshot)
 
     if delete_cached_file:
         local_path = Path(str(removed.get("local_path", "")))
@@ -246,3 +265,19 @@ def _ensure_cache_loaded() -> None:
         _library_cache = {}
     else:
         _library_cache = {str(key): value for key, value in data.items() if isinstance(value, dict)}
+
+
+def _load_collection_cache_locked(kind: str) -> dict[str, dict[str, Any]]:
+    """Load and cache transcript/analysis collections while holding the lock."""
+    global _transcripts_cache, _analysis_cache
+    if kind == "transcripts":
+        if _transcripts_cache is None:
+            data = _read_json(TRANSCRIPT_FILE, {})
+            _transcripts_cache = {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+        return _transcripts_cache
+    if kind == "analysis":
+        if _analysis_cache is None:
+            data = _read_json(ANALYSIS_FILE, {})
+            _analysis_cache = {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+        return _analysis_cache
+    raise ValueError(f"Unsupported collection cache kind: {kind}")

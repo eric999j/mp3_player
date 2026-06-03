@@ -108,6 +108,7 @@ def download_url(url: str, on_progress: ProgressCallback | None = None) -> dict:
     temp_path = AUDIO_CACHE_DIR / f"download-{int(time.time())}.tmp"
     total_bytes = int(response.headers.get("content-length") or 0)
     downloaded = 0
+    last_reported_percent = -1
     with open(temp_path, "wb") as file_obj:
         for chunk in response.iter_content(chunk_size=1024 * 256):
             if not chunk:
@@ -116,7 +117,9 @@ def download_url(url: str, on_progress: ProgressCallback | None = None) -> dict:
             downloaded += len(chunk)
             if on_progress and total_bytes:
                 percent = int((downloaded / total_bytes) * 100)
-                on_progress(f"下載音訊中... {percent}%")
+                if percent != last_reported_percent:
+                    on_progress(f"下載音訊中... {percent}%")
+                    last_reported_percent = percent
 
     # Verify download completeness when Content-Length was provided
     if total_bytes and downloaded != total_bytes:

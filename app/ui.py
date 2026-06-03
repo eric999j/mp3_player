@@ -63,6 +63,7 @@ class Mp3InsightApp:
         self.current_source: dict[str, Any] | None = None
         self.current_transcript: dict[str, Any] | None = None
         self.current_analysis: dict[str, Any] | None = None
+        self._library_snapshot: dict[str, dict[str, Any]] = {}
         self.palette = PALETTES.get(str(self.settings.get("theme", "light")), PALETTES["light"])
         self._seeking = False
         self._last_saved_second = 0
@@ -318,7 +319,22 @@ class Mp3InsightApp:
 
     def _scan_workspace_audio(self) -> None:
         library = storage.load_library()
+        existing_original_paths: set[str] = set()
+        for entry in library.values():
+            original = str(entry.get("original_path", "")).strip()
+            if not original:
+                continue
+            try:
+                existing_original_paths.add(str(Path(original).resolve()))
+            except OSError:
+                existing_original_paths.add(original)
         for path in Path.cwd().glob("*.mp3"):
+            try:
+                resolved = str(path.resolve())
+            except OSError:
+                resolved = str(path)
+            if resolved in existing_original_paths:
+                continue
             try:
                 source = source_manager.register_local_file(str(path))
                 if str(source["id"]) not in library:
@@ -327,9 +343,10 @@ class Mp3InsightApp:
                 continue
 
     def _refresh_library(self) -> None:
+        self._library_snapshot = storage.load_library()
         for item in self.library_tree.get_children():
             self.library_tree.delete(item)
-        entries = sorted(storage.load_library().values(), key=lambda entry: entry.get("last_played_ts", entry.get("created_ts", 0)), reverse=True)
+        entries = sorted(self._library_snapshot.values(), key=lambda entry: entry.get("last_played_ts", entry.get("created_ts", 0)), reverse=True)
         for entry in entries:
             status = str(entry.get("analysis_status", "not_started"))
             if status == "failed" and entry.get("last_error"):
@@ -343,13 +360,19 @@ class Mp3InsightApp:
                 _fmt_ts(entry.get("last_played_ts")),
             ))
 
+    def _get_library_entry(self, audio_id: str) -> dict[str, Any] | None:
+        if audio_id in self._library_snapshot:
+            return self._library_snapshot[audio_id]
+        self._library_snapshot = storage.load_library()
+        return self._library_snapshot.get(audio_id)
+
     def _rename_selected_library_item(self) -> None:
         from tkinter import simpledialog
         selected = self.library_tree.selection()
         if not selected:
             return
         audio_id = selected[0]
-        source = storage.load_library().get(audio_id)
+        source = self._get_library_entry(audio_id)
         if not source:
             return
         current = str(source.get("title", ""))
@@ -427,7 +450,7 @@ class Mp3InsightApp:
         selected = self.library_tree.selection()
         if not selected:
             return
-        source = storage.load_library().get(selected[0])
+        source = self._get_library_entry(str(selected[0]))
         if source:
             self._load_source(source)
 
@@ -579,7 +602,7 @@ class Mp3InsightApp:
         selected = self.library_tree.selection()
         if not selected:
             return
-        source = storage.load_library().get(str(selected[0]))
+        source = self._get_library_entry(str(selected[0]))
         if not source:
             return
         # Only reload player if this is a different audio from what's currently loaded
@@ -618,7 +641,7 @@ class Mp3InsightApp:
         if not selected:
             return
         audio_id = str(selected[0])
-        source = storage.load_library().get(audio_id)
+        source = self._get_library_entry(audio_id)
         if not source:
             return
         title = str(source.get("title", audio_id))
