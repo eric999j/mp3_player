@@ -16,6 +16,17 @@ from .time_utils import format_ms
 
 PAD = 8
 
+# Playback tick cadence (ms). Kept low enough for a smooth progress bar without
+# hammering storage — playback state only flushes on second-boundary changes.
+PLAYER_TICK_MS = 250
+SEARCH_DEBOUNCE_MS = 180
+
+SOURCE_TYPE_LABELS = {
+    "file": "檔案",
+    "url": "網址",
+    "youtube": "YouTube",
+}
+
 
 THEME_OPTIONS = [("淺色 Light", "light"), ("暗色 Dark", "dark")]
 THEME_LABEL_BY_NAME = {name: label for label, name in THEME_OPTIONS}
@@ -23,26 +34,36 @@ THEME_NAME_BY_LABEL = {label: name for label, name in THEME_OPTIONS}
 
 PALETTES = {
     "light": {
-        "app_bg": "#f3f6fb",
-        "surface_bg": "#eef3f9",
+        "app_bg": "#f4f7fb",
+        "surface_bg": "#e6ecf5",
         "input_bg": "#ffffff",
-        "text_fg": "#142033",
-        "muted_fg": "#32506d",
-        "accent": "#0f6cbd",
+        "text_fg": "#152238",
+        "muted_fg": "#4c6889",
+        "accent": "#1e6fd9",
+        "accent_hover": "#3a86e6",
         "accent_fg": "#ffffff",
         "tree_bg": "#ffffff",
-        "tree_selected_bg": "#b7d7f4",
+        "tree_selected_bg": "#c8ddf6",
+        "video_bg": "#050912",
+        "video_hint_fg": "#7891b8",
+        "row_alt_bg": "#f7f9fd",
+        "playing_bg": "#dbeafe",
     },
     "dark": {
-        "app_bg": "#10161f",
-        "surface_bg": "#18212d",
-        "input_bg": "#223041",
+        "app_bg": "#0f151f",
+        "surface_bg": "#18212f",
+        "input_bg": "#212d3f",
         "text_fg": "#e6edf6",
-        "muted_fg": "#8fc3ff",
+        "muted_fg": "#9cc0f0",
         "accent": "#5aa9ff",
-        "accent_fg": "#08111f",
-        "tree_bg": "#18212d",
-        "tree_selected_bg": "#36516f",
+        "accent_hover": "#7cbcff",
+        "accent_fg": "#0a1220",
+        "tree_bg": "#141c28",
+        "tree_selected_bg": "#324a6a",
+        "video_bg": "#000000",
+        "video_hint_fg": "#8aa4c4",
+        "row_alt_bg": "#182233",
+        "playing_bg": "#274469",
     },
 }
 
@@ -59,6 +80,7 @@ class Mp3InsightApp:
         self.root = root
         self.root.title("MP3 Insight Player")
         self.root.geometry(WINDOW_GEOMETRY)
+        self.root.minsize(960, 620)
         self.settings = storage.load_settings()
         self.current_source: dict[str, Any] | None = None
         self.current_transcript: dict[str, Any] | None = None
@@ -67,8 +89,13 @@ class Mp3InsightApp:
         self.palette = PALETTES.get(str(self.settings.get("theme", "light")), PALETTES["light"])
         self._seeking = False
         self._last_saved_second = 0
+        self._last_saved_position_ms = -1
         self._player_error = ""
         self._analyzing_id: str | None = None
+        self._search_after_id: str | None = None
+        self._video_attached_handle: int | None = None
+        self._rendered_transcript_key: tuple[str, str] | None = None
+        self._rendered_analysis_key: str | None = None
         try:
             self.player = Mp3Player()
         except PlayerError as exc:
@@ -81,6 +108,7 @@ class Mp3InsightApp:
         self._apply_widget_colors()
         self._refresh_library()
         self._update_player_tick()
+        self.root.after(80, self._attach_video_widget)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_style(self) -> None:
@@ -91,14 +119,16 @@ class Mp3InsightApp:
         self.root.configure(bg=palette["app_bg"])
         style.configure(".", background=palette["app_bg"], foreground=palette["text_fg"], fieldbackground=palette["input_bg"])
         style.configure("TFrame", background=palette["app_bg"])
+        style.configure("Video.TFrame", background=palette["video_bg"])
         style.configure("TLabelframe", background=palette["app_bg"], foreground=palette["text_fg"])
         style.configure("TLabelframe.Label", background=palette["app_bg"], foreground=palette["text_fg"])
         style.configure("TLabel", background=palette["app_bg"], foreground=palette["text_fg"])
-        style.configure("TButton", padding=(10, 6), background=palette["surface_bg"], foreground=palette["text_fg"])
+        style.configure("TButton", padding=(10, 6), background=palette["surface_bg"], foreground=palette["text_fg"], borderwidth=0)
         style.map("TButton", background=[("active", palette["input_bg"])], foreground=[("active", palette["text_fg"])])
-        style.configure("Accent.TButton", padding=(10, 6), background=palette["accent"], foreground=palette["accent_fg"])
-        style.map("Accent.TButton", background=[("active", palette["accent"])], foreground=[("active", palette["accent_fg"])])
-        style.configure("Header.TLabel", font=("Segoe UI", 12, "bold"), background=palette["app_bg"], foreground=palette["text_fg"])
+        style.configure("Accent.TButton", padding=(12, 7), background=palette["accent"], foreground=palette["accent_fg"], borderwidth=0)
+        style.map("Accent.TButton", background=[("active", palette["accent_hover"])], foreground=[("active", palette["accent_fg"])])
+        style.configure("Header.TLabel", font=("Segoe UI", 13, "bold"), background=palette["app_bg"], foreground=palette["text_fg"])
+        style.configure("SubHeader.TLabel", font=("Segoe UI", 10), background=palette["app_bg"], foreground=palette["muted_fg"])
         style.configure("Status.TLabel", background=palette["app_bg"], foreground=palette["muted_fg"])
         style.configure("TEntry", fieldbackground=palette["input_bg"], foreground=palette["text_fg"], insertcolor=palette["text_fg"])
         style.configure("TCombobox", fieldbackground=palette["input_bg"], foreground=palette["text_fg"], background=palette["surface_bg"])
@@ -106,11 +136,12 @@ class Mp3InsightApp:
         style.configure("TCheckbutton", background=palette["app_bg"], foreground=palette["text_fg"])
         style.map("TCheckbutton", background=[("active", palette["app_bg"])], foreground=[("active", palette["text_fg"])])
         style.configure("TNotebook", background=palette["app_bg"], borderwidth=0)
-        style.configure("TNotebook.Tab", background=palette["surface_bg"], foreground=palette["text_fg"], padding=(12, 6))
+        style.configure("TNotebook.Tab", background=palette["surface_bg"], foreground=palette["text_fg"], padding=(14, 7))
         style.map("TNotebook.Tab", background=[("selected", palette["input_bg"])], foreground=[("selected", palette["text_fg"])])
-        style.configure("Treeview", background=palette["tree_bg"], fieldbackground=palette["tree_bg"], foreground=palette["text_fg"])
+        style.configure("Treeview", background=palette["tree_bg"], fieldbackground=palette["tree_bg"], foreground=palette["text_fg"], rowheight=24)
         style.map("Treeview", background=[("selected", palette["tree_selected_bg"])], foreground=[("selected", palette["text_fg"])])
         style.configure("Treeview.Heading", background=palette["surface_bg"], foreground=palette["text_fg"])
+        style.configure("Horizontal.TScale", background=palette["app_bg"], troughcolor=palette["surface_bg"])
 
     def _apply_widget_colors(self) -> None:
         palette = self.palette
@@ -129,10 +160,20 @@ class Mp3InsightApp:
                 selectbackground=palette["tree_selected_bg"],
                 selectforeground=palette["text_fg"],
             )
+        if getattr(self, "video_container", None) is not None:
+            self.video_container.configure(bg=palette["video_bg"])
+        if getattr(self, "video_frame", None) is not None:
+            self.video_frame.configure(bg=palette["video_bg"])
+        if getattr(self, "video_placeholder", None) is not None:
+            self.video_placeholder.configure(bg=palette["video_bg"], fg=palette["video_hint_fg"])
+        if getattr(self, "library_tree", None) is not None:
+            self.library_tree.tag_configure("playing", background=palette["playing_bg"])
+            self.library_tree.tag_configure("row", background=palette["tree_bg"])
+            self.library_tree.tag_configure("row_alt", background=palette["row_alt_bg"])
 
     def _build_ui(self) -> None:
         # Status bar — packed first so it anchors to the very bottom
-        self.status_var = tk.StringVar(value=self._player_error or "請載入 MP3 網址或本地檔。")
+        self.status_var = tk.StringVar(value=self._player_error or "請貼上 MP3 / YouTube 網址，或載入本地音訊。")
         ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel").pack(
             side="bottom", fill="x", padx=PAD, pady=(0, 4))
 
@@ -168,13 +209,20 @@ class Mp3InsightApp:
         panel = ttk.LabelFrame(self.root, text="播放控制")
         panel.pack(side="bottom", fill="x", padx=PAD, pady=(0, PAD))
 
-        # Now-playing title
+        # Now-playing title + source-type badge
         title_row = ttk.Frame(panel)
         title_row.pack(fill="x", padx=PAD, pady=(4, 0))
         self.now_playing_var = tk.StringVar(value="尚未載入音訊")
         self.lbl_now_playing = ttk.Label(title_row, textvariable=self.now_playing_var, style="Header.TLabel")
         self.lbl_now_playing.pack(side="left")
         self.lbl_now_playing.bind("<Button-3>", lambda _e: self._rename_current_title())
+        self.source_badge_var = tk.StringVar(value="")
+        ttk.Label(title_row, textvariable=self.source_badge_var, style="SubHeader.TLabel").pack(side="left", padx=(PAD, 0))
+        ttk.Label(
+            title_row,
+            text="  ⌨ Space 播放/暫停　← / → 5 秒微調",
+            style="SubHeader.TLabel",
+        ).pack(side="right")
 
         # Progress row
         prog_row = ttk.Frame(panel)
@@ -202,29 +250,57 @@ class Mp3InsightApp:
         ttk.Label(ctrl_row, text="音量").pack(side="left", padx=(0, 4))
         self.volume_var = tk.IntVar(value=int(self.settings.get("volume", 80)))
         ttk.Scale(ctrl_row, from_=0, to=100, variable=self.volume_var,
-                  command=self._set_volume, length=100).pack(side="left", padx=(0, PAD))
+                  command=self._set_volume, length=120).pack(side="left", padx=(0, PAD))
 
     def _build_player_tab(self) -> None:
-        source_frame = ttk.LabelFrame(self.player_tab, text="音訊來源")
+        source_frame = ttk.LabelFrame(self.player_tab, text="音訊 / 影片來源")
         source_frame.pack(fill="x", padx=PAD, pady=PAD)
-        self.url_var = tk.StringVar(value="https://filesb.soundon.fm/file/filesb/abf48784-54b4-47b4-a376-b3a344156345.mp3")
-        ttk.Entry(source_frame, textvariable=self.url_var).grid(row=0, column=0, sticky="ew", padx=PAD, pady=PAD)
+        self.url_var = tk.StringVar(value="")
+        url_entry = ttk.Entry(source_frame, textvariable=self.url_var)
+        url_entry.grid(row=0, column=0, sticky="ew", padx=PAD, pady=PAD)
+        url_entry.bind("<Return>", lambda _e: self._load_url())
         ttk.Button(source_frame, text="載入網址", command=self._load_url).grid(row=0, column=1, padx=(0, PAD))
         ttk.Button(source_frame, text="開啟檔案", command=self._open_file).grid(row=0, column=2, padx=(0, PAD))
         ttk.Button(source_frame, text="分析音訊", command=self._analyze_current, style="Accent.TButton").grid(row=0, column=3, padx=(0, PAD))
+        ttk.Label(
+            source_frame,
+            text="支援 MP3 直連網址、YouTube 影片網址，以及本地音訊 / 影片檔（.mp3 .wav .flac .m4a .mp4 .mkv .webm）。",
+            style="SubHeader.TLabel",
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=PAD, pady=(0, PAD))
         source_frame.columnconfigure(0, weight=1)
+
+        # Video output area — VLC draws into this frame via set_hwnd. Even for
+        # audio-only sources it acts as a neutral dark canvas that keeps the
+        # layout stable.
+        self.video_container = tk.Frame(self.player_tab, bg=self.palette["video_bg"], height=280)
+        self.video_container.pack(fill="x", padx=PAD, pady=(0, PAD))
+        self.video_container.pack_propagate(False)
+        self.video_frame = tk.Frame(self.video_container, bg=self.palette["video_bg"], highlightthickness=0)
+        self.video_frame.pack(fill="both", expand=True)
+        self.video_placeholder = tk.Label(
+            self.video_frame,
+            text="🎬  影片畫面\n\n載入 YouTube 或影片檔後在此顯示，音訊會照常播放。",
+            bg=self.palette["video_bg"],
+            fg=self.palette["video_hint_fg"],
+            font=("Segoe UI", 11),
+            justify="center",
+        )
+        self.video_placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
         library_frame = ttk.LabelFrame(self.player_tab, text="播放清單與最近播放")
         library_frame.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
-        columns = ("title", "duration", "status", "last_played")
+        columns = ("title", "type", "duration", "status", "last_played")
         self.library_tree = ttk.Treeview(library_frame, columns=columns, show="headings", height=9)
         self.library_tree.heading("title", text="標題")
+        self.library_tree.heading("type", text="來源")
         self.library_tree.heading("duration", text="長度")
         self.library_tree.heading("status", text="分析狀態")
         self.library_tree.heading("last_played", text="最後播放")
-        self.library_tree.column("title", width=420)
-        self.library_tree.column("duration", width=90, anchor="center")
-        self.library_tree.column("status", width=110, anchor="center")
+        self.library_tree.column("title", width=380)
+        self.library_tree.column("type", width=80, anchor="center")
+        self.library_tree.column("duration", width=80, anchor="center")
+        self.library_tree.column("status", width=120, anchor="center")
         self.library_tree.column("last_played", width=150, anchor="center")
         self.library_tree.pack(side="left", fill="both", expand=True)
         library_scroll = ttk.Scrollbar(library_frame, orient="vertical", command=self.library_tree.yview)
@@ -245,11 +321,11 @@ class Mp3InsightApp:
         self.search_var = tk.StringVar()
         search_entry = ttk.Entry(top, textvariable=self.search_var, width=40)
         search_entry.pack(side="left", fill="x", expand=True, padx=(0, PAD))
-        search_entry.bind("<KeyRelease>", lambda _event: self._render_transcript())
-        ttk.Button(top, text="清除", command=lambda: [self.search_var.set(""), self._render_transcript()]).pack(side="left")
+        search_entry.bind("<KeyRelease>", self._schedule_transcript_render)
+        ttk.Button(top, text="清除", command=self._clear_transcript_search).pack(side="left")
         ttk.Label(top, text="  點擊段落即可跳播", style="Status.TLabel").pack(side="left", padx=(PAD, 0))
 
-        self.transcript_list = tk.Listbox(self.transcript_tab, font=("Segoe UI", 10))
+        self.transcript_list = tk.Listbox(self.transcript_tab, font=("Segoe UI", 10), activestyle="dotbox")
         self.transcript_list.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
         # Single-click seeks to that segment
         self.transcript_list.bind("<ButtonRelease-1>", lambda _event: self._seek_selected_transcript())
@@ -347,18 +423,25 @@ class Mp3InsightApp:
         for item in self.library_tree.get_children():
             self.library_tree.delete(item)
         entries = sorted(self._library_snapshot.values(), key=lambda entry: entry.get("last_played_ts", entry.get("created_ts", 0)), reverse=True)
-        for entry in entries:
+        current_id = str(self.current_source["id"]) if self.current_source else ""
+        for index, entry in enumerate(entries):
             status = str(entry.get("analysis_status", "not_started"))
             if status == "failed" and entry.get("last_error"):
                 status = f"failed: {str(entry.get('last_error'))[:48]}"
             elif status == "failed":
                 status = "failed: 請右鍵重新分析"
-            self.library_tree.insert("", "end", iid=str(entry["id"]), values=(
+            audio_id = str(entry["id"])
+            type_label = SOURCE_TYPE_LABELS.get(str(entry.get("source_type", "")), "音訊")
+            tags: list[str] = ["row_alt" if index % 2 else "row"]
+            if audio_id == current_id:
+                tags.append("playing")
+            self.library_tree.insert("", "end", iid=audio_id, values=(
                 entry.get("title", ""),
+                type_label,
                 format_ms(entry.get("duration_ms", 0)),
                 status,
                 _fmt_ts(entry.get("last_played_ts")),
-            ))
+            ), tags=tuple(tags))
 
     def _get_library_entry(self, audio_id: str) -> dict[str, Any] | None:
         if audio_id in self._library_snapshot:
@@ -417,12 +500,17 @@ class Mp3InsightApp:
     def _load_url(self) -> None:
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showinfo("提示", "請輸入 MP3 網址。")
+            messagebox.showinfo("提示", "請輸入 MP3 或 YouTube 網址。")
             return
-        self._run_background("載入網址", lambda: source_manager.download_url(url, self._thread_status), self._on_source_loaded)
+        label = "解析 YouTube" if source_manager._is_youtube_url(url) else "載入網址"
+        self._run_background(label, lambda: source_manager.load_url(url, self._thread_status), self._on_source_loaded)
 
     def _open_file(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("MP3 音訊", "*.mp3"), ("所有檔案", "*.*")])
+        path = filedialog.askopenfilename(filetypes=[
+            ("音訊 / 影片", "*.mp3 *.wav *.flac *.m4a *.ogg *.mp4 *.mkv *.webm *.mov"),
+            ("MP3 音訊", "*.mp3"),
+            ("所有檔案", "*.*"),
+        ])
         if path:
             self._run_background("開啟檔案", lambda: source_manager.register_local_file(path), self._on_source_loaded)
 
@@ -462,6 +550,7 @@ class Mp3InsightApp:
             self.status_var.set(self._player_error)
             return
         try:
+            self._attach_video_widget()
             self.player.load(str(source.get("local_path") or source.get("source_url")))
             self.player.set_volume(self.volume_var.get())
             resume_ms = int(source.get("last_position_ms", 0) or 0)
@@ -473,8 +562,11 @@ class Mp3InsightApp:
             title = str(source.get('title', ''))
             self.status_var.set(f"已載入：{title}")
             self.now_playing_var.set(title or "（無標題）")
-            self._render_transcript()
-            self._render_analysis()
+            self._update_source_badge(source)
+            self._update_video_placeholder(source_manager.has_video(source))
+            self._render_transcript(force=True)
+            self._render_analysis(force=True)
+            self._highlight_current_library_row()
         except Exception as exc:
             self.status_var.set(f"播放載入失敗：{exc}")
 
@@ -533,13 +625,19 @@ class Mp3InsightApp:
                 self.time_var.set(f"{format_ms(position)} / {format_ms(duration)}")
                 if duration > 0 and not self._seeking:
                     self.progress_var.set((position / duration) * 1000)
-                if self.current_source and int(time.time()) != self._last_saved_second:
-                    self._last_saved_second = int(time.time())
+                current_second = int(time.time())
+                if (
+                    self.current_source
+                    and current_second != self._last_saved_second
+                    and abs(position - self._last_saved_position_ms) >= 500
+                ):
+                    self._last_saved_second = current_second
+                    self._last_saved_position_ms = position
                     storage.update_playback_state(str(self.current_source["id"]), position, duration)
             except Exception:
                 pass
         storage.flush_library()
-        self.root.after(500, self._update_player_tick)
+        self.root.after(PLAYER_TICK_MS, self._update_player_tick)
 
     def _analyze_current(self) -> None:
         if not self.current_source:
@@ -619,22 +717,91 @@ class Mp3InsightApp:
         self.current_analysis = analysis
         used_model = str(transcript.get("asr_model", ""))
         self.status_var.set(f"分析完成。ASR：{used_model}" if used_model else "分析完成。")
-        self._render_transcript()
-        self._render_analysis()
+        self._render_transcript(force=True)
+        self._render_analysis(force=True)
         self._refresh_library()
         self.notebook.select(self.analysis_tab)
 
-    def _render_transcript(self) -> None:
+    def _attach_video_widget(self) -> None:
+        """Bind VLC video output to the video frame (idempotent)."""
+        if not self.player or not hasattr(self.player, "attach_video_widget"):
+            return
+        try:
+            self.video_frame.update_idletasks()
+            handle = int(self.video_frame.winfo_id())
+        except Exception:
+            return
+        if handle == self._video_attached_handle:
+            return
+        self.player.attach_video_widget(handle)
+        self._video_attached_handle = handle
+
+    def _update_source_badge(self, source: dict[str, Any] | None) -> None:
+        if not source:
+            self.source_badge_var.set("")
+            return
+        label = SOURCE_TYPE_LABELS.get(str(source.get("source_type", "")), "音訊")
+        origin = str(source.get("source_url") or source.get("original_path") or "")
+        if origin:
+            origin = origin if len(origin) <= 60 else origin[:57] + "…"
+            self.source_badge_var.set(f"[{label}] {origin}")
+        else:
+            self.source_badge_var.set(f"[{label}]")
+
+    def _update_video_placeholder(self, has_video: bool) -> None:
+        if getattr(self, "video_placeholder", None) is None:
+            return
+        if has_video:
+            self.video_placeholder.place_forget()
+        else:
+            self.video_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _highlight_current_library_row(self) -> None:
+        if not self.current_source:
+            return
+        audio_id = str(self.current_source["id"])
+        if self.library_tree.exists(audio_id):
+            self.library_tree.selection_set(audio_id)
+            self.library_tree.see(audio_id)
+
+    def _render_transcript(self, force: bool = False) -> None:
+        source_id = str(self.current_source["id"]) if self.current_source else ""
+        query = self.search_var.get().strip()
+        key = (source_id, query.lower())
+        if not force and key == self._rendered_transcript_key:
+            return
+        self._rendered_transcript_key = key
+        query_lower = key[1]
         self.transcript_list.delete(0, "end")
         transcript = self.current_transcript or {}
-        query = self.search_var.get().strip().lower()
         for chunk in transcript.get("chunks", []) or []:
             text = str(chunk.get("text", ""))
-            if query and query not in text.lower():
+            if query_lower and query_lower not in text.lower():
                 continue
             label = f"[{format_ms(chunk.get('start_ms', 0))}] {text}"
             self.transcript_list.insert("end", label)
-            self.transcript_list.itemconfig("end", foreground=self.palette["text_fg"])
+
+    def _schedule_transcript_render(self, _event=None) -> None:
+        if self._search_after_id is not None:
+            try:
+                self.root.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+        self._search_after_id = self.root.after(SEARCH_DEBOUNCE_MS, self._debounced_render_transcript)
+
+    def _debounced_render_transcript(self) -> None:
+        self._search_after_id = None
+        self._render_transcript()
+
+    def _clear_transcript_search(self) -> None:
+        if self._search_after_id is not None:
+            try:
+                self.root.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+            self._search_after_id = None
+        self.search_var.set("")
+        self._render_transcript(force=True)
 
     def _delete_selected_library_item(self) -> None:
         selected = self.library_tree.selection()
@@ -656,13 +823,20 @@ class Mp3InsightApp:
             self.current_analysis = None
             self.time_var.set("00:00 / 00:00")
             self.progress_var.set(0)
-            self._render_transcript()
-            self._render_analysis()
+            self.now_playing_var.set("尚未載入音訊")
+            self.source_badge_var.set("")
+            self._update_video_placeholder(False)
+            self._render_transcript(force=True)
+            self._render_analysis(force=True)
         removed = storage.delete_audio_source(audio_id, delete_cached_file=True)
         self._refresh_library()
         self.status_var.set("已刪除檔案與相關資料。" if removed else "找不到要刪除的項目。")
 
-    def _render_analysis(self) -> None:
+    def _render_analysis(self, force: bool = False) -> None:
+        source_id = str(self.current_source["id"]) if self.current_source else ""
+        if not force and source_id == self._rendered_analysis_key:
+            return
+        self._rendered_analysis_key = source_id
         self.summary_text.delete("1.0", "end")
         for item in self.keyword_tree.get_children():
             self.keyword_tree.delete(item)
@@ -802,9 +976,9 @@ class Mp3InsightApp:
             token = token.strip()
             if token:
                 paths.append(token)
-        audio_paths = [p for p in paths if Path(p).suffix.lower() in {".mp3", ".wav", ".flac", ".m4a", ".ogg"}]
+        audio_paths = [p for p in paths if Path(p).suffix.lower() in {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".mp4", ".mkv", ".webm", ".mov"}]
         if not audio_paths:
-            self.status_var.set("請拖放支援的音訊檔案（.mp3 .wav .flac .m4a .ogg）。")
+            self.status_var.set("請拖放支援的音訊 / 影片檔（.mp3 .wav .flac .m4a .ogg .mp4 .mkv .webm .mov）。")
             return
         # Load the first valid audio file
         first = audio_paths[0]

@@ -1,8 +1,9 @@
-"""Audio URL and local-file handling."""
+"""Audio/video URL and local-file handling."""
 from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import shutil
 import time
 from pathlib import Path
@@ -19,9 +20,34 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str], None]
 
+# Extensions that VLC and mutagen can treat as video sources.
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+
+_YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "youtu.be", "www.youtu.be",
+    "music.youtube.com",
+}
+
 
 class SourceError(Exception):
     pass
+
+
+def _is_youtube_url(url: str) -> bool:
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    return host in _YOUTUBE_HOSTS
+
+
+def has_video(source: dict) -> bool:
+    """Return True when the source likely contains a video track."""
+    if str(source.get("source_type", "")) == "youtube":
+        return True
+    local_path = str(source.get("local_path") or "")
+    if local_path and Path(local_path).suffix.lower() in VIDEO_EXTENSIONS:
+        return True
+    return False
 
 
 def _http_session() -> requests.Session:
@@ -143,6 +169,147 @@ def download_url(url: str, on_progress: ProgressCallback | None = None) -> dict:
         "local_path": str(cached_path),
         "title": _title_from_url(cleaned_url),
         "duration_ms": _duration_ms(cached_path),
+        "analysis_status": "not_started",
+        "created_ts": int(time.time()),
+    }
+
+
+def load_url(url: str, on_progress: ProgressCallback | None = None) -> dict:
+    """Dispatch a URL to the right fetcher (YouTube via yt-dlp, else direct download)."""
+    if _is_youtube_url(url):
+        return fetch_youtube(url, on_progress)
+    return download_url(url, on_progress)
+
+
+def fetch_youtube(url: str, on_progress: ProgressCallback | None = None) -> dict:
+    """Download a YouTube video (video + audio muxed) via yt-dlp and register it."""
+    ensure_dirs()
+    cleaned_url = str(url or "").strip()
+    if not cleaned_url:
+        raise SourceError("請輸入 YouTube 網址。")
+
+    try:
+        import yt_dlp  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise SourceError("需要 yt-dlp 才能播放 YouTube。請執行：pip install yt-dlp") from exc
+
+    if on_progress:
+        on_progress("正在解析 YouTube 網址...")
+
+    info_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(cleaned_url, download=False)
+    except yt_dlp.utils.DownloadError as exc:  # type: ignore[attr-defined]
+        raise SourceError(f"無法讀取 YouTube 資訊：{exc}") from exc
+
+    if isinstance(info, dict) and "entries" in info:
+        entries = [entry for entry in info.get("entries") or [] if entry]
+        if not entries:
+            raise SourceError("YouTube 網址沒有可用的影片。")
+        info = entries[0]
+
+    video_id = str(info.get("id") or "").strip() or _fallback_video_id(cleaned_url)
+    if not video_id:
+        raise SourceError("無法辨識 YouTube 影片編號。")
+    audio_id = f"yt-{video_id}"
+    title = str(info.get("title") or video_id).strip() or video_id
+    duration_ms = int((info.get("duration") or 0) * 1000)
+
+    cached_existing = _find_cached_youtube_file(audio_id)
+    if cached_existing is not None:
+        if on_progress:
+            on_progress("使用已快取的 YouTube 檔案")
+        return _make_youtube_source(audio_id, cleaned_url, title, duration_ms, cached_existing)
+
+    last_percent = {"value": -1}
+
+    def hook(status: dict) -> None:
+        if not on_progress:
+            return
+        state = status.get("status")
+        if state == "downloading":
+            downloaded = int(status.get("downloaded_bytes") or 0)
+            total = int(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
+            if total > 0:
+                percent = int((downloaded / total) * 100)
+                if percent != last_percent["value"]:
+                    on_progress(f"下載 YouTube 影音中... {percent}%")
+                    last_percent["value"] = percent
+        elif state == "finished":
+            on_progress("YouTube 下載完成，處理中...")
+
+    output_template = str(AUDIO_CACHE_DIR / f"{audio_id}.%(ext)s")
+    dl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "outtmpl": output_template,
+        # Prefer pre-muxed <=720p mp4 to avoid an ffmpeg merge step; fall back gracefully.
+        "format": "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best",
+        "progress_hooks": [hook],
+        "retries": 3,
+        "fragment_retries": 3,
+        "overwrites": False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            info = ydl.extract_info(cleaned_url, download=True)
+    except yt_dlp.utils.DownloadError as exc:  # type: ignore[attr-defined]
+        raise SourceError(f"YouTube 下載失敗：{exc}") from exc
+
+    if isinstance(info, dict) and "entries" in info:
+        entries = [entry for entry in info.get("entries") or [] if entry]
+        if entries:
+            info = entries[0]
+
+    cached_path = _find_cached_youtube_file(audio_id)
+    if cached_path is None:
+        raise SourceError("YouTube 下載完成，但找不到檔案。")
+
+    return _make_youtube_source(audio_id, cleaned_url, title, duration_ms, cached_path)
+
+
+def _fallback_video_id(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.hostname and parsed.hostname.endswith("youtu.be"):
+        return parsed.path.lstrip("/")
+    for key in ("v",):
+        match = re.search(rf"[?&]{key}=([^&#]+)", parsed.query)
+        if match:
+            return match.group(1)
+    match = re.search(r"/shorts/([^/?#]+)", parsed.path)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _find_cached_youtube_file(audio_id: str) -> Path | None:
+    for suffix in (".mp4", ".mkv", ".webm", ".m4a", ".mp3"):
+        candidate = AUDIO_CACHE_DIR / f"{audio_id}{suffix}"
+        if candidate.exists():
+            return candidate
+    for candidate in AUDIO_CACHE_DIR.glob(f"{audio_id}.*"):
+        if candidate.is_file() and candidate.suffix.lower() not in {".part", ".tmp"}:
+            return candidate
+    return None
+
+
+def _make_youtube_source(audio_id: str, url: str, title: str, duration_ms: int, cached_path: Path) -> dict:
+    resolved_duration = duration_ms if duration_ms > 0 else _duration_ms(cached_path)
+    return {
+        "id": audio_id,
+        "source_type": "youtube",
+        "source_url": url,
+        "original_path": "",
+        "local_path": str(cached_path),
+        "title": title,
+        "duration_ms": resolved_duration,
         "analysis_status": "not_started",
         "created_ts": int(time.time()),
     }

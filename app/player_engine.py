@@ -1,6 +1,7 @@
 """MP3 playback engine with VLC first and pygame fallback."""
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -12,6 +13,7 @@ class PlayerError(Exception):
 class Mp3Player:
     def __init__(self) -> None:
         self._backend = "vlc"
+        self._video_handle: int | None = None
         try:
             import vlc
         except Exception as exc:
@@ -165,6 +167,41 @@ class Mp3Player:
 
     def backend_name(self) -> str:
         return self._backend
+
+    def attach_video_widget(self, handle: int | None) -> None:
+        """Bind VLC video output to a native window handle (Tk widget's winfo_id())."""
+        if self._backend != "vlc":
+            return
+        try:
+            if handle in (None, 0):
+                # Detach so VLC opens its own window if it renders video later.
+                if sys.platform == "win32":
+                    self._player.set_hwnd(0)
+                elif sys.platform == "darwin":
+                    self._player.set_nsobject(0)
+                else:
+                    self._player.set_xwindow(0)
+                self._video_handle = None
+                return
+            handle_int = int(handle)
+            if sys.platform == "win32":
+                self._player.set_hwnd(handle_int)
+            elif sys.platform == "darwin":
+                self._player.set_nsobject(handle_int)
+            else:
+                self._player.set_xwindow(handle_int)
+            self._video_handle = handle_int
+        except Exception:
+            pass
+
+    def has_video(self) -> bool:
+        """Return True if the currently loaded media exposes a video track."""
+        if self._backend != "vlc":
+            return False
+        try:
+            return int(self._player.video_get_track_count() or 0) > 0
+        except Exception:
+            return False
 
     def _read_duration_ms(self, source: str) -> int:
         try:
